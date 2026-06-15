@@ -1,0 +1,42 @@
+Ghostscript内蔵版 ライセンス注意書き
+=====================================
+
+対象ファイル:
+  camelotToExcel_FitToDaicho2.0_includeGS.exe
+
+この実行ファイルには、Artifex Software, Inc. が提供する
+Ghostscriptの実行コンポーネントが含まれています。
+
+本内蔵版の作成時に使用したGhostscript:
+  Ghostscript 10.05.1 (64-bit Windows版)
+
+ライセンス:
+  Ghostscriptのオープンソース版はGNU Affero General Public License
+  version 3（GNU AGPL v3）の条件で提供されています。
+  ライセンス原文は、同じフォルダの
+  Ghostscript_AGPL_COPYING.txt を参照してください。
+
+再配布時の注意:
+  1. このEXEを第三者へ配布する場合、Ghostscriptのライセンス条件を
+     遵守する必要があります。
+  2. この注意書きとGhostscript_AGPL_COPYING.txtを、EXEと一緒に
+     配布してください。
+  3. ソフトウェアの改変、組織外への配布、ネットワーク経由での提供
+     など、利用形態によってソースコード提供等の義務が生じる可能性が
+     あります。
+  4. GNU AGPL v3の条件が用途に合わない場合、Artifexが提供する
+     商用ライセンスの利用を検討してください。
+  5. Ghostscript以外のPythonライブラリにも、それぞれのライセンスが
+     適用されます。
+
+この文書は一般的な注意事項であり、法的助言ではありません。
+実際の配布・販売・組織内外での運用条件については、GNU AGPL v3の
+原文およびArtifexの最新ライセンス情報を確認し、必要に応じて専門家へ
+相談してください。
+
+Ghostscript:
+  Copyright (C) Artifex Software, Inc.
+  https://www.ghostscript.com/
+
+GNU AGPL v3:
+  https://www.gnu.org/licenses/agpl-3.0.html
