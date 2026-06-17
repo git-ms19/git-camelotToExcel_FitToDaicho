@@ -1,10 +1,12 @@
 import os
 import glob
+import re
 import shutil
 import subprocess
 import sys
 import tkinter as tk
-from collections import defaultdict
+import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
@@ -14,7 +16,8 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
-from pdfminer.layout import LTChar
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTChar, LTTextContainer
 
 
 EXPECTED_COLUMN_COUNT = 19
@@ -25,6 +28,13 @@ DEFAULT_COLUMNS = (
     "546.38,575.65,605.17,747.94"
 )
 DEFAULT_TABLE_AREAS = ""
+BRANCH_NAME_PATTERN = re.compile(
+    r"([\u3041-\u3096\u30a1-\u30fa\u30fc"
+    r"\u4e00-\u9fff\u3005\u3006\u30f5\u30f6]+)"
+    r"\s*\u5206\u4f1a"
+)
+GROUP_NUMBER_PATTERN = re.compile(r"([0-9\uff10-\uff19]{2})\s*\u73ed")
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def find_ghostscript_executable():
@@ -128,6 +138,57 @@ class ExtractedTable:
     df: pd.DataFrame
     page: int
     accuracy: float
+    output_name: str = ""
+
+
+def extract_page_names(pdf_path):
+    """Read the branch and group identifiers from every PDF page."""
+    page_names = {}
+    for page_number, layout in enumerate(extract_pages(pdf_path), start=1):
+        text = "\n".join(
+            element.get_text()
+            for element in layout
+            if isinstance(element, LTTextContainer)
+        )
+        output_name = extract_output_name(text)
+        if output_name:
+            page_names[page_number] = output_name
+    return page_names
+
+
+def extract_output_name(text):
+    branch_match = BRANCH_NAME_PATTERN.search(text)
+    group_match = GROUP_NUMBER_PATTERN.search(text)
+    if not branch_match or not group_match:
+        return None
+
+    branch = unicodedata.normalize("NFKC", branch_match.group(1))
+    group = unicodedata.normalize("NFKC", group_match.group(1))
+    return f"{branch}{group}"
+
+
+def make_output_names(tables, max_length=None):
+    """Return page names, adding p1, p2... to every duplicate."""
+    base_names = [table.output_name for table in tables]
+    counts = Counter(base_names)
+    sequence = defaultdict(int)
+    output_names = []
+    for base_name in base_names:
+        suffix = ""
+        if counts[base_name] > 1:
+            sequence[base_name] += 1
+            suffix = f"p{sequence[base_name]}"
+        if max_length is not None:
+            base_name = base_name[:max_length - len(suffix)]
+        output_names.append(f"{base_name}{suffix}")
+    return output_names
+
+
+def sanitize_output_name(value):
+    sanitized = INVALID_FILENAME_CHARS.sub("_", value).strip(" .")
+    if not sanitized:
+        raise ValueError("PDF page name is empty after sanitizing.")
+    return sanitized
 
 
 def parse_list(value):
@@ -511,6 +572,7 @@ def normalize_page_tables(page_tables, configured_separators):
 
 
 def extract_daicho(pdf_path, pages, options, configured_separators):
+    page_names = extract_page_names(pdf_path)
     options = dict(options)
     resolution = int(options.pop("resolution", 300))
     options["backend"] = InstalledGhostscriptBackend(resolution=resolution)
@@ -535,6 +597,14 @@ def extract_daicho(pdf_path, pages, options, configured_separators):
             tables_by_page[page_number], configured_separators
         )
         if normalized is not None:
+            if page_number not in page_names:
+                raise ValueError(
+                    f"page {page_number}: "
+                    "branch/group text could not be read."
+                )
+            normalized.output_name = sanitize_output_name(
+                page_names[page_number]
+            )
             extracted.append(normalized)
     return extracted
 
@@ -546,13 +616,12 @@ def export_tables(tables, pdf_path, output_folder, output_format):
     output_base = os.path.join(output_folder, f"{base}_{timestamp}")
 
     if output_format == "excel":
+        output_names = make_output_names(tables, max_length=31)
         output_path = output_base + ".xlsx"
         workbook = Workbook()
         workbook.remove(workbook.active)
-        for index, table in enumerate(tables, start=1):
-            sheet = workbook.create_sheet(
-                title=f"page_{table.page}_table_{index}"
-            )
+        for table, output_name in zip(tables, output_names):
+            sheet = workbook.create_sheet(title=output_name)
             for row in dataframe_to_rows(
                 table.df, index=False, header=False
             ):
@@ -566,10 +635,11 @@ def export_tables(tables, pdf_path, output_folder, output_format):
         return [output_path]
 
     extension = "md" if output_format == "markdown" else output_format
+    output_names = make_output_names(tables)
     output_paths = []
-    for index, table in enumerate(tables, start=1):
-        output_path = (
-            f"{output_base}_page_{table.page}_table_{index}.{extension}"
+    for table, output_name in zip(tables, output_names):
+        output_path = os.path.join(
+            output_folder, f"{output_name}.{extension}"
         )
         if output_format == "csv":
             table.df.to_csv(
