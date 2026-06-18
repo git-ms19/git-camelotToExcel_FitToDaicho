@@ -1,5 +1,6 @@
 import os
 import glob
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
+from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar
 
 
@@ -130,12 +132,147 @@ class ExtractedTable:
     accuracy: float
 
 
+@dataclass(frozen=True)
+class PageInfo:
+    branch: str = ""
+    division: str = ""
+    division_code: str = ""
+    group: str = ""
+
+    def missing_fields(self):
+        missing = []
+        if not self.branch:
+            missing.append("支部")
+        if not self.division:
+            missing.append("分会")
+        if not self.division_code:
+            missing.append("分会コード")
+        if not self.group:
+            missing.append("班")
+        return missing
+
+
 def parse_list(value):
     return [item.strip() for item in value.split(";") if item.strip()]
 
 
 def parse_bool(value):
     return value.strip().lower() in {"true", "1", "yes", "on"}
+
+
+def normalize_pdf_text(value):
+    return (
+        value.replace("\u3000", " ")
+        .replace("（", "(")
+        .replace("）", ")")
+        .strip()
+    )
+
+
+def to_ascii_digits(value):
+    table = str.maketrans("０１２３４５６７８９", "0123456789")
+    return value.translate(table)
+
+
+def two_digit_code(value):
+    digits = to_ascii_digits(value).strip()
+    if digits.isdigit():
+        return digits.zfill(2)
+    return digits
+
+
+def iter_text_objects(layout_object):
+    if isinstance(layout_object, LTChar):
+        return
+    if hasattr(layout_object, "get_text"):
+        text = layout_object.get_text()
+        if text:
+            yield text
+            return
+    if hasattr(layout_object, "__iter__"):
+        for child in layout_object:
+            yield from iter_text_objects(child)
+
+
+def extract_pdf_page_lines(pdf_path):
+    pages = {}
+    for page_number, page_layout in enumerate(extract_pages(pdf_path), start=1):
+        lines = []
+        for text in iter_text_objects(page_layout):
+            for line in text.splitlines():
+                line = normalize_pdf_text(line)
+                if line:
+                    lines.append(line)
+        pages[page_number] = lines
+    return pages
+
+
+def parse_page_info(lines):
+    text = normalize_pdf_text(" ".join(lines))
+    branch = ""
+    division = ""
+    division_code = ""
+    group = ""
+
+    branch_match = re.search(r"([^\s,、。()]+?)支部", text)
+    if branch_match:
+        branch = branch_match.group(1).strip()
+
+    group_match = re.search(r"([0-9０-９]{1,2})\s*班", text)
+    if group_match:
+        group = two_digit_code(group_match.group(1))
+
+    division_code_match = re.search(
+        r"([^\s,、。()]+?)分会\s*\(\s*([0-9０-９]{1,2})\s*\)",
+        text,
+    )
+    if division_code_match:
+        division = division_code_match.group(1).strip()
+        if "支部" in division:
+            division = division.rsplit("支部", 1)[1].strip()
+        division_code = two_digit_code(division_code_match.group(2))
+    else:
+        division_match = re.search(r"([^\s,、。()]+?)分会", text)
+        if division_match:
+            division = division_match.group(1).strip()
+            if "支部" in division:
+                division = division.rsplit("支部", 1)[1].strip()
+            code_end = group_match.start() if group_match else len(text)
+            code_area = text[division_match.end():code_end]
+            code_match = re.search(r"([0-9０-９]{1,2})", code_area)
+            if code_match:
+                division_code = two_digit_code(code_match.group(1))
+
+    return PageInfo(
+        branch=branch,
+        division=division,
+        division_code=division_code,
+        group=group,
+    )
+
+
+def extract_page_infos(pdf_path):
+    return {
+        page_number: parse_page_info(lines)
+        for page_number, lines in extract_pdf_page_lines(pdf_path).items()
+    }
+
+
+def export_page_text_debug(pdf_path, output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(
+        output_folder, f"{base}_{timestamp}_page_text_debug.txt"
+    )
+    page_lines = extract_pdf_page_lines(pdf_path)
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        for page_number in sorted(page_lines):
+            output_file.write(f"===== page {page_number} =====\n")
+            for line in page_lines[page_number]:
+                output_file.write(line + "\n")
+            output_file.write("\n")
+    return output_path
 
 
 def validate_coordinate_string(value, expected_count=None):
@@ -539,61 +676,121 @@ def extract_daicho(pdf_path, pages, options, configured_separators):
     return extracted
 
 
+def clean_cell_value(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def build_one_sheet_table(table, page_info):
+    if table.df.empty:
+        return table.df.copy()
+
+    source_rows = table.df.fillna("").values.tolist()
+    header = [
+        "支部",
+        "分会",
+        "分会コード",
+        "班",
+        "組合員番号",
+    ] + [clean_cell_value(value) for value in source_rows[0]]
+    output_rows = [header]
+
+    for row_index in range(1, len(source_rows), 3):
+        if row_index + 1 >= len(source_rows):
+            break
+        upper_row = source_rows[row_index]
+        middle_row = source_rows[row_index + 1]
+        member_number = clean_cell_value(upper_row[NAME_COLUMN_INDEX])
+        output_rows.append(
+            [
+                page_info.branch,
+                page_info.division,
+                page_info.division_code,
+                page_info.group,
+                member_number,
+            ]
+            + [clean_cell_value(value) for value in middle_row]
+        )
+
+    return pd.DataFrame(output_rows)
+
+
+def combine_one_sheet_tables(tables, page_infos):
+    combined_rows = []
+    warnings = []
+    for table in tables:
+        page_info = page_infos.get(table.page, PageInfo())
+        missing = page_info.missing_fields()
+        if missing:
+            warnings.append(
+                f"page {table.page}: "
+                + "、".join(missing)
+                + "を取得できませんでした。"
+            )
+        one_sheet = build_one_sheet_table(table, page_info)
+        if one_sheet.empty:
+            continue
+        rows = one_sheet.values.tolist()
+        if not combined_rows:
+            combined_rows.extend(rows)
+        else:
+            combined_rows.extend(rows[1:])
+
+    if not combined_rows:
+        return pd.DataFrame(), warnings
+    return pd.DataFrame(combined_rows), warnings
+
+
 def export_tables(tables, pdf_path, output_folder, output_format):
     os.makedirs(output_folder, exist_ok=True)
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = os.path.join(output_folder, f"{base}_{timestamp}")
+    page_infos = extract_page_infos(pdf_path)
+    combined_df, warnings = combine_one_sheet_tables(tables, page_infos)
 
     if output_format == "excel":
         output_path = output_base + ".xlsx"
         workbook = Workbook()
-        workbook.remove(workbook.active)
-        for index, table in enumerate(tables, start=1):
-            sheet = workbook.create_sheet(
-                title=f"page_{table.page}_table_{index}"
-            )
-            for row in dataframe_to_rows(
-                table.df, index=False, header=False
-            ):
-                sheet.append(row)
-            for row in sheet.iter_rows():
-                for cell in row:
-                    cell.alignment = Alignment(
-                        vertical="center", wrap_text=True
-                    )
+        sheet = workbook.active
+        sheet.title = "all_pages"
+        for row in dataframe_to_rows(
+            combined_df, index=False, header=False
+        ):
+            sheet.append(row)
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(
+                    vertical="center", wrap_text=True
+                )
         workbook.save(output_path)
-        return [output_path]
+        return [output_path], warnings
 
     extension = "md" if output_format == "markdown" else output_format
-    output_paths = []
-    for index, table in enumerate(tables, start=1):
-        output_path = (
-            f"{output_base}_page_{table.page}_table_{index}.{extension}"
+    output_path = f"{output_base}.{extension}"
+    if output_format == "csv":
+        combined_df.to_csv(
+            output_path,
+            index=False,
+            header=False,
+            encoding="utf-8-sig",
         )
-        if output_format == "csv":
-            table.df.to_csv(
-                output_path,
-                index=False,
-                header=False,
-                encoding="utf-8-sig",
+    elif output_format == "json":
+        combined_df.to_json(
+            output_path,
+            orient="values",
+            force_ascii=False,
+            indent=2,
+        )
+    elif output_format == "html":
+        combined_df.to_html(output_path, index=False, header=False)
+    elif output_format == "markdown":
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            output_file.write(
+                combined_df.to_markdown(index=False, headers=[])
             )
-        elif output_format == "json":
-            table.df.to_json(
-                output_path,
-                orient="values",
-                force_ascii=False,
-                indent=2,
-            )
-        elif output_format == "html":
-            table.df.to_html(output_path, index=False, header=False)
-        elif output_format == "markdown":
-            with open(output_path, "w", encoding="utf-8") as output_file:
-                output_file.write(
-                    table.df.to_markdown(index=False, headers=[])
-                )
-        output_paths.append(output_path)
-    return output_paths
+    return [output_path], warnings
 
 
 def run_camelot():
@@ -645,6 +842,9 @@ def run_camelot():
     warnings = []
     for pdf_path in pdf_paths:
         try:
+            debug_path = None
+            if page_text_debug_var.get():
+                debug_path = export_page_text_debug(pdf_path, output_folder)
             tables = extract_daicho(
                 pdf_path,
                 pages_var.get().strip() or "all",
@@ -658,17 +858,30 @@ def run_camelot():
                 )
                 continue
 
-            export_tables(
+            output_paths, export_warnings = export_tables(
                 tables,
                 pdf_path,
                 output_folder,
                 output_format_var.get(),
+            )
+            warnings.extend(
+                f"{os.path.basename(pdf_path)}: {warning}"
+                for warning in export_warnings
             )
             for table in tables:
                 results.append(
                     f"{os.path.basename(pdf_path)} page {table.page}: "
                     f"{table.df.shape[0]}行 x {table.df.shape[1]}列 / "
                     f"元表平均精度 {table.accuracy}%"
+                )
+            results.append(
+                f"{os.path.basename(pdf_path)}: "
+                f"{len(output_paths)}ファイルにまとめて出力しました。"
+            )
+            if debug_path:
+                results.append(
+                    f"{os.path.basename(pdf_path)}: "
+                    f"ページ本文確認用ログ {debug_path}"
                 )
         except Exception as exc:
             warnings.append(
@@ -762,6 +975,7 @@ threshold_constant_var = tk.StringVar(value="-2")
 iterations_var = tk.StringVar(value="0")
 resolution_var = tk.StringVar(value="300")
 process_background_var = tk.StringVar(value="False")
+page_text_debug_var = tk.BooleanVar(value=False)
 
 row = 0
 ttk.Label(main, text="PDFファイル").grid(
@@ -876,11 +1090,18 @@ ttk.Button(
 ).grid(row=row, column=1, sticky="w", padx=8, pady=8)
 
 row += 1
+ttk.Checkbutton(
+    main,
+    text="ページ本文確認用ログを出力する",
+    variable=page_text_debug_var,
+).grid(row=row, column=1, sticky="w", padx=8, pady=4)
+
+row += 1
 ttk.Label(
     main,
     text=(
-        "出力規則: 会員1名を必ず3行に展開します。"
-        "氏名列以外の値は中央行へ配置します。"
+        "出力規則: 会員1名を中央段の1行にまとめます。"
+        "支部・分会・分会コード・班・組合員番号を先頭列へ追加します。"
     ),
     foreground="#245a8d",
 ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5)
@@ -925,7 +1146,7 @@ ttk.Label(
 row += 1
 ttk.Button(
     main,
-    text="PDFから3行形式で抽出",
+    text="PDFから1シート形式で抽出",
     command=run_camelot,
 ).grid(
     row=row,
