@@ -7,7 +7,7 @@ import sys
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 
 import camelot
@@ -150,6 +150,13 @@ class PageInfo:
         if not self.group:
             missing.append("班")
         return missing
+
+
+@dataclass(frozen=True)
+class YearProcessingOptions:
+    enabled: bool = False
+    fiscal_year: int | None = None
+    unresolved_mode: str = "keep"
 
 
 def parse_list(value):
@@ -682,6 +689,170 @@ def clean_cell_value(value):
     return str(value).strip()
 
 
+def current_fiscal_year(today=None):
+    today = today or date.today()
+    return today.year if today.month >= 4 else today.year - 1
+
+
+def parse_month_label(value):
+    text = to_ascii_digits(clean_cell_value(value))
+    if not text.isdigit():
+        return None
+    month = int(text)
+    if 1 <= month <= 12:
+        return month
+    return None
+
+
+def base_year_for_month(fiscal_year, month):
+    return fiscal_year if month >= 4 else fiscal_year + 1
+
+
+def next_business_day_if_weekend(value):
+    while value.weekday() >= 5:
+        value += timedelta(days=1)
+    return value
+
+
+def monthly_header_date(fiscal_year, month):
+    value = date(base_year_for_month(fiscal_year, month), month, 25)
+    return next_business_day_if_weekend(value)
+
+
+def normalize_date_text(value):
+    return (
+        to_ascii_digits(clean_cell_value(value))
+        .replace("／", "/")
+        .replace("−", "-")
+        .replace("ー", "-")
+    )
+
+
+def extract_month_day(value):
+    text = normalize_date_text(value)
+    match = re.search(
+        r"(?<!\d)(0?[1-9]|1[0-2])\s*/\s*(0?[1-9]|[12]\d|3[01])(?!\d)",
+        text,
+    )
+    if not match:
+        return None
+    month = int(match.group(1))
+    day = int(match.group(2))
+    return month, day
+
+
+def make_payment_date(fiscal_year, month, day, previous_date=None):
+    year = base_year_for_month(fiscal_year, month)
+    while True:
+        value = date(year, month, day)
+        if previous_date is None or value >= previous_date:
+            return value
+        year += 1
+
+
+def format_date_for_text(value):
+    if isinstance(value, date):
+        return f"{value.year}/{value.month}/{value.day}"
+    return value
+
+
+def detect_month_columns(header):
+    expected = [4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3]
+    columns = []
+    for column_index, value in enumerate(header):
+        month = parse_month_label(value)
+        if month in expected:
+            columns.append((column_index, month))
+    return columns
+
+
+def resolve_unreadable_payment_text(value, mode):
+    original = clean_cell_value(value)
+    if not original:
+        return original, None
+    if mode == "keep":
+        return original, None
+    if mode == "circle":
+        marks = []
+        for char in original:
+            if char in {"〇", "○"}:
+                marks.append("〇")
+            elif char in {"-", "－", "−", "‐", "‑"}:
+                marks.append("-")
+        resolved = "".join(marks)
+    elif mode == "clear":
+        resolved = ""
+    else:
+        resolved = original
+    if resolved == original:
+        return resolved, None
+    return resolved, (original, resolved)
+
+
+def apply_year_processing(df, options, source_name=""):
+    if not options.enabled or df.empty:
+        return df, [], []
+
+    fiscal_year = options.fiscal_year or current_fiscal_year()
+    processed = df.copy()
+    warnings = []
+    header = processed.iloc[0].tolist()
+    month_columns = detect_month_columns(header)
+    expected_months = [4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3]
+    detected_months = [month for _, month in month_columns]
+    if detected_months != expected_months:
+        warnings.append(
+            "月列が想定順序と一致しません。検出: "
+            + ",".join(str(month) for month in detected_months)
+        )
+
+    for column_index, month in month_columns:
+        processed.iat[0, column_index] = monthly_header_date(
+            fiscal_year, month
+        )
+
+    for row_index in range(1, len(processed.index)):
+        previous_date = None
+        for column_index, month in month_columns:
+            raw_value = clean_cell_value(processed.iat[row_index, column_index])
+            if not raw_value:
+                continue
+            month_day = extract_month_day(raw_value)
+            if month_day is None:
+                resolved, removed = resolve_unreadable_payment_text(
+                    raw_value, options.unresolved_mode
+                )
+                processed.iat[row_index, column_index] = resolved
+                if removed is not None:
+                    original, after = removed
+                    after_label = after if after else "空白"
+                    warnings.append(
+                        f"{source_name} row {row_index + 1} / "
+                        f"{month}月列: 「{original}」を削除しました。"
+                        f"削除後: {after_label}"
+                    )
+                continue
+            raw_month, raw_day = month_day
+            try:
+                payment_date = make_payment_date(
+                    fiscal_year, raw_month, raw_day, previous_date
+                )
+            except ValueError:
+                warnings.append(
+                    f"{source_name} row {row_index + 1} / "
+                    f"{month}月列: 日付として扱えません: {raw_value}"
+                )
+                continue
+            processed.iat[row_index, column_index] = payment_date
+            previous_date = payment_date
+
+    return processed, warnings, [column for column, _ in month_columns]
+
+
+def format_dates_for_text_output(df):
+    return df.apply(lambda column: column.map(format_date_for_text))
+
+
 def build_one_sheet_table(table, page_info):
     if table.df.empty:
         return table.df.copy()
@@ -742,13 +913,20 @@ def combine_one_sheet_tables(tables, page_infos):
     return pd.DataFrame(combined_rows), warnings
 
 
-def export_tables(tables, pdf_path, output_folder, output_format):
+def export_tables(
+    tables, pdf_path, output_folder, output_format, year_options
+):
     os.makedirs(output_folder, exist_ok=True)
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = os.path.join(output_folder, f"{base}_{timestamp}")
     page_infos = extract_page_infos(pdf_path)
     combined_df, warnings = combine_one_sheet_tables(tables, page_infos)
+    source_name = os.path.basename(pdf_path)
+    combined_df, year_warnings, year_month_columns = apply_year_processing(
+        combined_df, year_options, source_name=source_name
+    )
+    warnings.extend(year_warnings)
 
     if output_format == "excel":
         output_path = output_base + ".xlsx"
@@ -764,31 +942,37 @@ def export_tables(tables, pdf_path, output_folder, output_format):
                 cell.alignment = Alignment(
                     vertical="center", wrap_text=True
                 )
+                if year_options.enabled and cell.column - 1 in year_month_columns:
+                    if cell.row == 1 and isinstance(cell.value, date):
+                        cell.number_format = "m"
+                    elif isinstance(cell.value, date):
+                        cell.number_format = "m/d"
         workbook.save(output_path)
         return [output_path], warnings
 
     extension = "md" if output_format == "markdown" else output_format
     output_path = f"{output_base}.{extension}"
+    text_df = format_dates_for_text_output(combined_df)
     if output_format == "csv":
-        combined_df.to_csv(
+        text_df.to_csv(
             output_path,
             index=False,
             header=False,
             encoding="utf-8-sig",
         )
     elif output_format == "json":
-        combined_df.to_json(
+        text_df.to_json(
             output_path,
             orient="values",
             force_ascii=False,
             indent=2,
         )
     elif output_format == "html":
-        combined_df.to_html(output_path, index=False, header=False)
+        text_df.to_html(output_path, index=False, header=False)
     elif output_format == "markdown":
         with open(output_path, "w", encoding="utf-8") as output_file:
             output_file.write(
-                combined_df.to_markdown(index=False, headers=[])
+                text_df.to_markdown(index=False, headers=[])
             )
     return [output_path], warnings
 
@@ -828,6 +1012,28 @@ def run_camelot():
         }
         if table_areas:
             options["table_areas"] = table_areas
+
+        year_options = YearProcessingOptions()
+        if year_processing_var.get():
+            fiscal_year_text = fiscal_year_var.get().strip()
+            if fiscal_year_text:
+                if not re.fullmatch(r"\d{4}", fiscal_year_text):
+                    raise ValueError("年度は西暦4桁で入力してください。")
+                fiscal_year = int(fiscal_year_text)
+            else:
+                fiscal_year = current_fiscal_year()
+            unresolved_mode_labels = {
+                "すべて残す": "keep",
+                "〇・-だけ残す": "circle",
+                "すべて消す": "clear",
+            }
+            year_options = YearProcessingOptions(
+                enabled=True,
+                fiscal_year=fiscal_year,
+                unresolved_mode=unresolved_mode_labels[
+                    unreadable_payment_var.get()
+                ],
+            )
     except ValueError as exc:
         messagebox.showerror("設定エラー", str(exc))
         return
@@ -863,6 +1069,7 @@ def run_camelot():
                 pdf_path,
                 output_folder,
                 output_format_var.get(),
+                year_options,
             )
             warnings.extend(
                 f"{os.path.basename(pdf_path)}: {warning}"
@@ -953,7 +1160,7 @@ if len(sys.argv) >= 3 and sys.argv[1] == "--self-test-pdf":
 
 root = tk.Tk()
 root.title("Camelot 台帳19列抽出ツール 2.0")
-root.geometry("980x790")
+root.geometry("980x830")
 root.minsize(820, 700)
 
 main = ttk.Frame(root, padding=12)
@@ -976,6 +1183,9 @@ iterations_var = tk.StringVar(value="0")
 resolution_var = tk.StringVar(value="300")
 process_background_var = tk.StringVar(value="False")
 page_text_debug_var = tk.BooleanVar(value=False)
+year_processing_var = tk.BooleanVar(value=False)
+fiscal_year_var = tk.StringVar()
+unreadable_payment_var = tk.StringVar(value="すべて残す")
 
 row = 0
 ttk.Label(main, text="PDFファイル").grid(
@@ -1095,6 +1305,27 @@ ttk.Checkbutton(
     text="ページ本文確認用ログを出力する",
     variable=page_text_debug_var,
 ).grid(row=row, column=1, sticky="w", padx=8, pady=4)
+
+row += 1
+year_frame = ttk.Frame(main)
+year_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+ttk.Checkbutton(
+    year_frame,
+    text="年度処理を行う",
+    variable=year_processing_var,
+).pack(side="left", padx=(0, 14))
+ttk.Label(year_frame, text="年度").pack(side="left", padx=(0, 4))
+ttk.Entry(year_frame, textvariable=fiscal_year_var, width=8).pack(
+    side="left", padx=(0, 14)
+)
+ttk.Label(year_frame, text="日付なし文字").pack(side="left", padx=(0, 4))
+ttk.Combobox(
+    year_frame,
+    textvariable=unreadable_payment_var,
+    values=("すべて残す", "〇・-だけ残す", "すべて消す"),
+    width=12,
+    state="readonly",
+).pack(side="left")
 
 row += 1
 ttk.Label(
