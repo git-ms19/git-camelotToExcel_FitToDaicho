@@ -1,4 +1,5 @@
 import os
+import configparser
 import glob
 import re
 import shutil
@@ -853,6 +854,131 @@ def format_dates_for_text_output(df):
     return df.apply(lambda column: column.map(format_date_for_text))
 
 
+def default_extract_options():
+    return {
+        "line_scale": 25,
+        "line_tol": 2,
+        "joint_tol": 2,
+        "threshold_blocksize": 15,
+        "threshold_constant": -2,
+        "iterations": 0,
+        "resolution": 300,
+        "process_background": False,
+        "split_text": False,
+        "flag_size": False,
+    }
+
+
+def parse_unreadable_payment_mode(value):
+    normalized = clean_cell_value(value)
+    labels = {
+        "すべて残す": "keep",
+        "keep": "keep",
+        "〇・-だけ残す": "circle",
+        "〇だけ残す": "circle",
+        "circle": "circle",
+        "mark": "circle",
+        "すべて消す": "clear",
+        "clear": "clear",
+    }
+    if normalized not in labels:
+        raise ValueError(
+            "日付なし文字の扱いは "
+            "「すべて残す」「〇・-だけ残す」「すべて消す」"
+            " のいずれかにしてください。"
+        )
+    return labels[normalized]
+
+
+def build_year_options(enabled, fiscal_year_text, unreadable_payment):
+    if not enabled:
+        return YearProcessingOptions()
+    fiscal_year_text = clean_cell_value(fiscal_year_text)
+    if fiscal_year_text:
+        if not re.fullmatch(r"\d{4}", fiscal_year_text):
+            raise ValueError("年度は西暦4桁で入力してください。")
+        fiscal_year = int(fiscal_year_text)
+    else:
+        fiscal_year = current_fiscal_year()
+    return YearProcessingOptions(
+        enabled=True,
+        fiscal_year=fiscal_year,
+        unresolved_mode=parse_unreadable_payment_mode(unreadable_payment),
+    )
+
+
+def process_pdf_paths(
+    pdf_paths,
+    pages,
+    output_folder,
+    output_format,
+    options,
+    separators,
+    year_options,
+    page_text_debug=False,
+):
+    results = []
+    warnings = []
+    if not output_folder:
+        output_folder = os.path.join(os.path.dirname(pdf_paths[0]), "result")
+
+    for pdf_path in pdf_paths:
+        try:
+            debug_path = None
+            if page_text_debug:
+                debug_path = export_page_text_debug(pdf_path, output_folder)
+            tables = extract_daicho(
+                pdf_path,
+                pages,
+                options,
+                separators,
+            )
+            if not tables:
+                warnings.append(
+                    f"{os.path.basename(pdf_path)}: "
+                    "19列の台帳表を検出できませんでした。"
+                )
+                continue
+
+            output_paths, export_warnings = export_tables(
+                tables,
+                pdf_path,
+                output_folder,
+                output_format,
+                year_options,
+            )
+            warnings.extend(
+                f"{os.path.basename(pdf_path)}: {warning}"
+                for warning in export_warnings
+            )
+            for table in tables:
+                results.append(
+                    f"{os.path.basename(pdf_path)} page {table.page}: "
+                    f"{table.df.shape[0]}行 x {table.df.shape[1]}列 / "
+                    f"元表平均精度 {table.accuracy}%"
+                )
+            results.append(
+                f"{os.path.basename(pdf_path)}: "
+                f"{len(output_paths)}ファイルにまとめて出力しました。"
+            )
+            if debug_path:
+                results.append(
+                    f"{os.path.basename(pdf_path)}: "
+                    f"ページ本文確認用ログ {debug_path}"
+                )
+        except Exception as exc:
+            warnings.append(
+                f"{os.path.basename(pdf_path)}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    summary = "\n".join(results) if results else "出力できた表はありません。"
+    if warnings:
+        summary += "\n\n警告:\n" + "\n".join(warnings)
+    summary += f"\n\n出力先:\n{output_folder}"
+    return summary
+
+
 def build_one_sheet_table(table, page_info):
     if table.df.empty:
         return table.df.copy()
@@ -998,110 +1124,44 @@ def run_camelot():
         for area in table_areas:
             validate_coordinate_string(area, expected_count=4)
 
-        options = {
-            "line_scale": int(line_scale_var.get()),
-            "line_tol": int(line_tol_var.get()),
-            "joint_tol": int(joint_tol_var.get()),
-            "threshold_blocksize": int(threshold_blocksize_var.get()),
-            "threshold_constant": int(threshold_constant_var.get()),
-            "iterations": int(iterations_var.get()),
-            "resolution": int(resolution_var.get()),
-            "process_background": parse_bool(process_background_var.get()),
-            "split_text": False,
-            "flag_size": False,
-        }
+        options = default_extract_options()
+        options.update(
+            {
+                "line_scale": int(line_scale_var.get()),
+                "line_tol": int(line_tol_var.get()),
+                "joint_tol": int(joint_tol_var.get()),
+                "threshold_blocksize": int(threshold_blocksize_var.get()),
+                "threshold_constant": int(threshold_constant_var.get()),
+                "iterations": int(iterations_var.get()),
+                "resolution": int(resolution_var.get()),
+                "process_background": parse_bool(
+                    process_background_var.get()
+                ),
+            }
+        )
         if table_areas:
             options["table_areas"] = table_areas
 
-        year_options = YearProcessingOptions()
-        if year_processing_var.get():
-            fiscal_year_text = fiscal_year_var.get().strip()
-            if fiscal_year_text:
-                if not re.fullmatch(r"\d{4}", fiscal_year_text):
-                    raise ValueError("年度は西暦4桁で入力してください。")
-                fiscal_year = int(fiscal_year_text)
-            else:
-                fiscal_year = current_fiscal_year()
-            unresolved_mode_labels = {
-                "すべて残す": "keep",
-                "〇・-だけ残す": "circle",
-                "すべて消す": "clear",
-            }
-            year_options = YearProcessingOptions(
-                enabled=True,
-                fiscal_year=fiscal_year,
-                unresolved_mode=unresolved_mode_labels[
-                    unreadable_payment_var.get()
-                ],
-            )
+        year_options = build_year_options(
+            year_processing_var.get(),
+            fiscal_year_var.get(),
+            unreadable_payment_var.get(),
+        )
+        summary = process_pdf_paths(
+            pdf_paths=pdf_paths,
+            pages=pages_var.get().strip() or "all",
+            output_folder=output_folder_var.get().strip(),
+            output_format=output_format_var.get(),
+            options=options,
+            separators=separators,
+            year_options=year_options,
+            page_text_debug=page_text_debug_var.get(),
+        )
     except ValueError as exc:
         messagebox.showerror("設定エラー", str(exc))
         return
 
-    output_folder = output_folder_var.get().strip()
-    if not output_folder:
-        output_folder = os.path.join(
-            os.path.dirname(pdf_paths[0]), "result"
-        )
-
-    results = []
-    warnings = []
-    for pdf_path in pdf_paths:
-        try:
-            debug_path = None
-            if page_text_debug_var.get():
-                debug_path = export_page_text_debug(pdf_path, output_folder)
-            tables = extract_daicho(
-                pdf_path,
-                pages_var.get().strip() or "all",
-                options,
-                separators,
-            )
-            if not tables:
-                warnings.append(
-                    f"{os.path.basename(pdf_path)}: "
-                    "19列の台帳表を検出できませんでした。"
-                )
-                continue
-
-            output_paths, export_warnings = export_tables(
-                tables,
-                pdf_path,
-                output_folder,
-                output_format_var.get(),
-                year_options,
-            )
-            warnings.extend(
-                f"{os.path.basename(pdf_path)}: {warning}"
-                for warning in export_warnings
-            )
-            for table in tables:
-                results.append(
-                    f"{os.path.basename(pdf_path)} page {table.page}: "
-                    f"{table.df.shape[0]}行 x {table.df.shape[1]}列 / "
-                    f"元表平均精度 {table.accuracy}%"
-                )
-            results.append(
-                f"{os.path.basename(pdf_path)}: "
-                f"{len(output_paths)}ファイルにまとめて出力しました。"
-            )
-            if debug_path:
-                results.append(
-                    f"{os.path.basename(pdf_path)}: "
-                    f"ページ本文確認用ログ {debug_path}"
-                )
-        except Exception as exc:
-            warnings.append(
-                f"{os.path.basename(pdf_path)}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    summary = "\n".join(results) if results else "出力できた表はありません。"
-    if warnings:
-        summary += "\n\n警告:\n" + "\n".join(warnings)
-    summary += f"\n\n出力先:\n{output_folder}"
     messagebox.showinfo("処理結果", summary)
-
 
 def select_pdf_files():
     paths = filedialog.askopenfilenames(
@@ -1132,6 +1192,132 @@ def reset_optimized_values():
     process_background_var.set("False")
 
 
+def app_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_ini_path():
+    base_dir = app_base_dir()
+    app_stem = os.path.splitext(os.path.basename(sys.executable))[0]
+    script_stem = os.path.splitext(os.path.basename(__file__))[0]
+    candidates = [
+        os.path.join(base_dir, app_stem + ".ini"),
+        os.path.join(base_dir, script_stem + ".ini"),
+        os.path.join(base_dir, "camelotToExcel_FitToDaicho.ini"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+def load_drop_ini():
+    config = configparser.ConfigParser()
+    ini_path = find_ini_path()
+    if os.path.isfile(ini_path):
+        config.read(ini_path, encoding="utf-8-sig")
+    return config, ini_path
+
+
+def get_ini_value(config, section, key, default):
+    if config.has_option(section, key):
+        return config.get(section, key)
+    return default
+
+
+def get_ini_bool(config, section, key, default):
+    if config.has_option(section, key):
+        return config.getboolean(section, key)
+    return default
+
+
+def get_ini_int(config, section, key, default):
+    if config.has_option(section, key):
+        return config.getint(section, key)
+    return default
+
+
+def build_auto_run_settings(config):
+    separators_text = get_ini_value(
+        config, "extract", "columns", DEFAULT_COLUMNS
+    )
+    separators = [float(value.strip()) for value in separators_text.split(",")]
+    if len(separators) != EXPECTED_COLUMN_COUNT - 1:
+        raise ValueError("columnsには19列を分ける18個の座標が必要です。")
+
+    table_areas = parse_list(
+        get_ini_value(config, "extract", "table_areas", DEFAULT_TABLE_AREAS)
+    )
+    for area in table_areas:
+        validate_coordinate_string(area, expected_count=4)
+
+    options = default_extract_options()
+    options.update(
+        {
+            "line_scale": get_ini_int(config, "extract", "line_scale", 25),
+            "line_tol": get_ini_int(config, "extract", "line_tol", 2),
+            "joint_tol": get_ini_int(config, "extract", "joint_tol", 2),
+            "threshold_blocksize": get_ini_int(
+                config, "extract", "threshold_blocksize", 15
+            ),
+            "threshold_constant": get_ini_int(
+                config, "extract", "threshold_constant", -2
+            ),
+            "iterations": get_ini_int(config, "extract", "iterations", 0),
+            "resolution": get_ini_int(config, "extract", "resolution", 300),
+            "process_background": get_ini_bool(
+                config, "extract", "process_background", False
+            ),
+        }
+    )
+    if table_areas:
+        options["table_areas"] = table_areas
+
+    year_options = build_year_options(
+        get_ini_bool(config, "year", "enabled", False),
+        get_ini_value(config, "year", "fiscal_year", ""),
+        get_ini_value(config, "year", "unreadable_payment", "すべて残す"),
+    )
+    return {
+        "pages": get_ini_value(config, "extract", "pages", "all").strip()
+        or "all",
+        "output_folder": get_ini_value(config, "output", "folder", "").strip(),
+        "output_format": get_ini_value(config, "output", "format", "excel")
+        .strip()
+        .lower(),
+        "options": options,
+        "separators": separators,
+        "year_options": year_options,
+        "page_text_debug": get_ini_bool(
+            config, "debug", "page_text_debug", False
+        ),
+    }
+
+
+def show_auto_run_message(title, message):
+    root = tk.Tk()
+    root.withdraw()
+    if title == "エラー":
+        messagebox.showerror(title, message, parent=root)
+    else:
+        messagebox.showinfo(title, message, parent=root)
+    root.destroy()
+
+
+def auto_run_from_drop(pdf_paths):
+    try:
+        config, ini_path = load_drop_ini()
+        settings = build_auto_run_settings(config)
+        summary = process_pdf_paths(pdf_paths=pdf_paths, **settings)
+        summary += f"\n\n設定ファイル:\n{ini_path}"
+        show_auto_run_message("処理結果", summary)
+    except Exception as exc:
+        show_auto_run_message("エラー", f"{type(exc).__name__}: {exc}")
+        raise SystemExit(1)
+
+
 if len(sys.argv) >= 3 and sys.argv[1] == "--self-test-pdf":
     self_test_options = {
         "line_scale": 25,
@@ -1155,6 +1341,15 @@ if len(sys.argv) >= 3 and sys.argv[1] == "--self-test-pdf":
         raise SystemExit(2)
     if self_test_tables[0].df.shape[1] != EXPECTED_COLUMN_COUNT:
         raise SystemExit(3)
+    raise SystemExit(0)
+
+
+drop_pdf_paths = [
+    path for path in sys.argv[1:]
+    if os.path.isfile(path) and path.lower().endswith(".pdf")
+]
+if drop_pdf_paths:
+    auto_run_from_drop(drop_pdf_paths)
     raise SystemExit(0)
 
 
